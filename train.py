@@ -1,30 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding:utf-8 -*-
-#############################################################
-# File: train.py
-# Created Date: Monday December 27th 2021
-# Author: Chen Xuanhong
-# Email: chenxuanhongzju@outlook.com
-# Last Modified:  Friday, 22nd April 2022 10:49:26 am
-# Modified By: Chen Xuanhong
-# Copyright (c) 2021 Shanghai Jiao Tong University
-#############################################################
-
 import os
 import time
 import random
 import argparse
 import numpy as np
+import datetime
 
 import torch
 import torch.nn.functional as F
-from torch.backends import cudnn
 import torch.utils.tensorboard as tensorboard
+
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from torch.backends import cudnn
 
 from util.plot import plot_batch
 
 from models.projected_model import fsModel
 from util.data_loader_Swapping import GetLoader
+from util.load_models import load_netArc
 
 def str2bool(v):
     return v.lower() in ('true')
@@ -37,7 +32,7 @@ class TrainOptions:
     def initialize(self):
         self.parser.add_argument('--name', type=str, default='simswap', help='name of the experiment. It decides where to store samples and models')
         self.parser.add_argument('--gpu_ids', default='0')
-        self.parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
+        self.parser.add_argument('--checkpoints_dir', type=str, default='./train_checkpoints', help='models are saved here')
         self.parser.add_argument('--isTrain', type=str2bool, default='True')
 
         # input/output sizes       
@@ -103,17 +98,19 @@ class TrainOptions:
 if __name__ == '__main__':
 
     opt         = TrainOptions().parse()
-    iter_path   = os.path.join(opt.checkpoints_dir, opt.name, 'iter.txt')
 
-    sample_path = os.path.join(opt.checkpoints_dir, opt.name, 'samples')
+    save_path = os.path.join(opt.checkpoints_dir, opt.name)
+    os.makedirs(save_path, exist_ok=True)
 
-    if not os.path.exists(sample_path):
-        os.makedirs(sample_path)
-    
-    log_path = os.path.join(opt.checkpoints_dir, opt.name, 'summary')
+    iter_path   = os.path.join(save_path, 'iter.txt')
+    sample_path = os.path.join(save_path, 'samples')
+    log_path = os.path.join(save_path, 'summary')
+    log_name = os.path.join(save_path, 'loss_log.txt')
 
-    if not os.path.exists(log_path):
-        os.makedirs(log_path)
+    dist.init_process_group("nccl", rank=opt.rank, world_size=opt.world_size)
+    torch.cuda.set_device(opt.local_rank)  
+    device = torch.device("cuda", opt.local_rank)
+    cudnn.benchmark = True
 
     if opt.continue_train:
         try:
@@ -123,17 +120,14 @@ if __name__ == '__main__':
         print('Resuming from epoch %d at iteration %d' % (start_epoch, epoch_iter))        
     else:    
         start_epoch, epoch_iter = 1, 0
+        
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(opt.gpu_ids)
-    print("GPU used : ", str(opt.gpu_ids))
+    # ArcFace 初始化
+    netArc = load_netArc(opt.Arc_path, device)
+    netArc = DDP(netArc, device_ids=[opt.local_rank], output_device=opt.local_rank)
 
-    
-    cudnn.benchmark = True
-
-    
-
+    # FaceSwap 初始化
     model = fsModel()
-
     model.initialize(opt)
 
     #####################################################
@@ -141,20 +135,18 @@ if __name__ == '__main__':
         tensorboard_writer  = tensorboard.SummaryWriter(log_path)
         logger              = tensorboard_writer
         
-    log_name = os.path.join(opt.checkpoints_dir, opt.name, 'loss_log.txt')
-
     with open(log_name, "a") as log_file:
         now = time.strftime("%c")
         log_file.write('================ Training Loss (%s) ================\n' % now)
 
-    optimizer_G, optimizer_D = model.optimizer_G, model.optimizer_D
+    optimizer_G, optimizer_D = model.module.optimizer_G, model.module.optimizer_D
 
     loss_avg        = 0
     refresh_count   = 0
     imagenet_std    = torch.Tensor([0.229, 0.224, 0.225]).view(3,1,1)
     imagenet_mean   = torch.Tensor([0.485, 0.456, 0.406]).view(3,1,1)
 
-    train_loader    = GetLoader(opt.dataset,opt.batchSize,8,1234)
+    train_loader    = GetLoader(opt.dataset, opt.batchSize, 8, 1234)
 
     randindex = [i for i in range(opt.batchSize)]
     random.shuffle(randindex)
@@ -164,14 +156,13 @@ if __name__ == '__main__':
     else:
         start   = int(opt.which_epoch)
     total_step  = opt.total_step
-    import datetime
     print("Start to train at %s"%(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
     
-    model.netD.feature_network.requires_grad_(False)
+    model.module.netD.feature_network.requires_grad_(False)
 
     # Training Cycle
     for step in range(start, total_step):
-        model.netG.train()
+        model.module.netG.train() 
         for interval in range(2):
             random.shuffle(randindex)
             src_image1, src_image2  = train_loader.next()
@@ -182,15 +173,16 @@ if __name__ == '__main__':
                 img_id = src_image2[randindex]
 
             img_id_112      = F.interpolate(img_id,size=(112,112), mode='bicubic')
-            latent_id       = model.netArc(img_id_112)
+            latent_id       = netArc(img_id_112)
             latent_id       = F.normalize(latent_id, p=2, dim=1)
+            
             if interval:
                 
-                img_fake        = model.netG(src_image1, latent_id)
-                gen_logits,_    = model.netD(img_fake.detach(), None)
+                img_fake        = model.module.netG(src_image1, latent_id)
+                gen_logits,_    = model.module.netD(img_fake.detach(), None)
                 loss_Dgen       = (F.relu(torch.ones_like(gen_logits) + gen_logits)).mean()
 
-                real_logits,_   = model.netD(src_image2,None)
+                real_logits,_   = model.module.netD(src_image2,None)
                 loss_Dreal      = (F.relu(torch.ones_like(real_logits) - real_logits)).mean()
 
                 loss_D          = loss_Dgen + loss_Dreal
@@ -199,24 +191,23 @@ if __name__ == '__main__':
                 optimizer_D.step()
             else:
                 
-                # model.netD.requires_grad_(True)
-                img_fake        = model.netG(src_image1, latent_id)
+                img_fake        = model.module.netG(src_image1, latent_id)
                 # G loss
-                gen_logits,feat = model.netD(img_fake, None)
+                gen_logits,feat = model.module.netD(img_fake, None)
                 
                 loss_Gmain      = (-gen_logits).mean()
                 img_fake_down   = F.interpolate(img_fake, size=(112,112), mode='bicubic')
-                latent_fake     = model.netArc(img_fake_down)
+                latent_fake     = netArc(img_fake_down)
                 latent_fake     = F.normalize(latent_fake, p=2, dim=1)
-                loss_G_ID       = (1 - model.cosin_metric(latent_fake, latent_id)).mean()
-                real_feat       = model.netD.get_feature(src_image1)
-                feat_match_loss = model.criterionFeat(feat["3"],real_feat["3"]) 
+                loss_G_ID       = (1 - model.module.cosin_metric(latent_fake, latent_id)).mean()
+                real_feat       = model.module.netD.get_feature(src_image1)
+                feat_match_loss = model.module.criterionFeat(feat["3"],real_feat["3"]) 
                 loss_G          = loss_Gmain + loss_G_ID * opt.lambda_id + feat_match_loss * opt.lambda_feat
                 
 
                 if step%2 == 0:
                     #G_Rec
-                    loss_G_Rec  = model.criterionRec(img_fake, src_image1) * opt.lambda_rec
+                    loss_G_Rec  = model.module.criterionRec(img_fake, src_image1) * opt.lambda_rec
                     loss_G      += loss_G_Rec
 
                 optimizer_G.zero_grad()
@@ -227,7 +218,7 @@ if __name__ == '__main__':
         ############## Display results and errors ##########
         ### print out errors
         # Print out log info
-        if (step + 1) % opt.log_frep == 0:
+        if (step + 1) % opt.log_frep == 0 and dist.get_rank() == 0:
             # errors = {k: v.data.item() if not isinstance(v, int) else v for k, v in loss_dict.items()}
             errors = {
                 "G_Loss":loss_Gmain.item(),
@@ -250,8 +241,8 @@ if __name__ == '__main__':
                 log_file.write('%s\n' % message)
 
         ### display output images
-        if (step + 1) % opt.sample_freq == 0:
-            model.netG.eval()
+        if (step + 1) % opt.sample_freq == 0 and dist.get_rank() == 0:
+            model.module.netG.eval()
             with torch.no_grad():
                 imgs        = list()
                 zero_img    = (torch.zeros_like(src_image1[0,...]))
@@ -260,14 +251,14 @@ if __name__ == '__main__':
                 for r in range(opt.batchSize):
                     imgs.append(save_img[r,...])
                 arcface_112     = F.interpolate(src_image2,size=(112,112), mode='bicubic')
-                id_vector_src1  = model.netArc(arcface_112)
+                id_vector_src1  = model.module.netArc(arcface_112)
                 id_vector_src1  = F.normalize(id_vector_src1, p=2, dim=1)
 
                 for i in range(opt.batchSize):
                     
                     imgs.append(save_img[i,...])
                     image_infer = src_image1[i, ...].repeat(opt.batchSize, 1, 1, 1)
-                    img_fake    = model.netG(image_infer, id_vector_src1).cpu()
+                    img_fake    = model.module.netG(image_infer, id_vector_src1).cpu()
                     
                     img_fake    = img_fake * imagenet_std
                     img_fake    = img_fake + imagenet_mean
@@ -279,7 +270,7 @@ if __name__ == '__main__':
                 plot_batch(imgs, os.path.join(sample_path, 'step_'+str(step+1)+'.jpg'))
 
         ### save latest model
-        if (step+1) % opt.model_freq==0:
+        if (step+1) % opt.model_freq==0 dist.get_rank() == 0:
             print('saving the latest model (steps %d)' % (step+1))
             model.save(step+1)            
             np.savetxt(iter_path, (step+1, total_step), delimiter=',', fmt='%d')

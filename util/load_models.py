@@ -37,6 +37,10 @@ def load_netArc(Arc_path, device):
     """
     netArc = torch.load(Arc_path, map_location=torch.device("cpu"))
     netArc = netArc.to(device)
+    
+    for param in netArc.parameters():
+        param.requires_grad = False
+        
     netArc.eval()
     
     return netArc
