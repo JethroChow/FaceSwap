@@ -24,7 +24,7 @@ from util.load_models import load_netArc
 def str2bool(v):
     return v.lower() in ('true')
 
-class TrainOptions:
+class Train:
     def __init__(self):
         self.parser = argparse.ArgumentParser()
         self.initialized = False
@@ -121,7 +121,6 @@ if __name__ == '__main__':
     else:    
         start_epoch, epoch_iter = 1, 0
         
-
     # ArcFace 初始化
     netArc = load_netArc(opt.Arc_path, device)
     netArc = DDP(netArc, device_ids=[opt.local_rank], output_device=opt.local_rank)
